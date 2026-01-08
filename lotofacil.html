@@ -1,0 +1,380 @@
+<!doctype html>
+<html lang="pt-br">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lotofácil — Análise Estatística</title>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+
+<style>
+  body { font-family: Arial, sans-serif; margin: 24px; }
+  h1 { margin-bottom: 6px; }
+  .muted { color:#666; font-size:12px; }
+  .card { border:1px solid #ddd; border-radius:12px; padding:16px; margin:14px 0; }
+  .row { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+  @media (max-width:900px){ .row{grid-template-columns:1fr;} }
+
+  button { padding:10px 14px; border-radius:10px; border:1px solid #ccc; background:#fff; cursor:pointer; }
+  button:hover { background:#f4f4f4; }
+  button:disabled { opacity:.6; cursor:not-allowed; }
+
+  pre { background:#fafafa; padding:12px; border-radius:10px; border:1px solid #ddd; }
+
+  table { border-collapse:collapse; width:100%; font-size:13px; }
+  th,td { border:1px solid #ddd; padding:6px; text-align:left; }
+  th { background:#f5f5f5; position: sticky; top: 0; }
+
+  .pill { display:inline-block; padding:2px 8px; border-radius:999px; border:1px solid #ccc; font-size:12px; }
+  .ok { background:#e9ffe9; border-color:#9ed89e; }
+  .err { background:#ffecec; border-color:#f2a0a0; }
+</style>
+</head>
+
+<body>
+
+<h1>Lotofácil — Análise (últimos 50 concursos)</h1>
+<div class="muted">
+  <span id="status" class="pill">carregando…</span>
+  <span id="baseInfo"></span>
+</div>
+
+<div class="card">
+  <h2>Gerador de Jogos (15 números)</h2>
+  <button id="btnQuentes" disabled>🔥 Quentes (5 jogos)</button>
+  <button id="btnBalanceada" disabled>⚖️ Balanceada (5 jogos)</button>
+  <button id="btnCopiar" disabled>📋 Copiar lista</button>
+
+  <pre id="saida">(aguardando dados)</pre>
+  <div id="botoesSnippets" style="margin-top:10px; display:flex; gap:10px; flex-wrap:wrap;"></div>
+</div>
+
+<div class="row">
+  <div class="card"><h2>Top 10 quentes</h2><canvas id="chartTop"></canvas></div>
+  <div class="card"><h2>Top 10 frios</h2><canvas id="chartBottom"></canvas></div>
+</div>
+
+<div class="card">
+  <h2>Distribuição geral (01–25)</h2>
+  <canvas id="chartHist"></canvas>
+</div>
+
+<div class="card">
+  <h2>Tabela completa</h2>
+  <div style="max-height:520px; overflow:auto;">
+    <table>
+      <thead><tr><th>Número</th><th>Vezes</th><th>%</th></tr></thead>
+      <tbody id="tbl"></tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+/* ================= CONFIG ================= */
+const API = "https://api.guidi.dev.br/loteria/lotofacil";
+const TOTAL = 50;
+
+/* ================= HELPERS ================= */
+const z2 = n => String(n).padStart(2,"0");
+
+const statusEl = document.getElementById("status");
+const baseInfoEl = document.getElementById("baseInfo");
+const saidaEl = document.getElementById("saida");
+const botoesSnippetsEl = document.getElementById("botoesSnippets");
+
+const btnQuentes = document.getElementById("btnQuentes");
+const btnBalanceada = document.getElementById("btnBalanceada");
+const btnCopiar = document.getElementById("btnCopiar");
+
+function ok(msg){ statusEl.textContent=msg; statusEl.className="pill ok"; }
+function err(msg){ statusEl.textContent=msg; statusEl.className="pill err"; }
+
+async function fetchJson(url){
+  const r = await fetch(url);
+  if(!r.ok) throw new Error("HTTP "+r.status);
+  return r.json();
+}
+
+/* ===== Detecta o número do concurso, mesmo se a API usar outro nome ===== */
+function getConcursoNumber(payload){
+  if(!payload) return null;
+
+  const keys = ["concurso","numero","numeroConcurso","numero_concurso","concursoNumero"];
+  for(const k of keys){
+    const v = payload[k];
+    const n = parseInt(v, 10);
+    if(Number.isFinite(n) && n > 0) return n;
+  }
+
+  // às vezes vem dentro de resultado
+  if(payload.resultado && typeof payload.resultado === "object"){
+    for(const k of keys){
+      const v = payload.resultado[k];
+      const n = parseInt(v, 10);
+      if(Number.isFinite(n) && n > 0) return n;
+    }
+  }
+
+  return null;
+}
+
+/* ===== EXTRAÇÃO ROBUSTA DAS DEZENAS ===== */
+function extrairDezenas(payload){
+  if(!payload) return null;
+
+  const keys = ["dezenas","numeros","listaDezenas","numerosSorteados","dezenasSorteadas"];
+  for(const k of keys){
+    if(Array.isArray(payload[k])) return payload[k].map(x=>parseInt(x,10));
+  }
+  if(payload.resultado && typeof payload.resultado === "object"){
+    for(const k of keys){
+      if(Array.isArray(payload.resultado[k])) return payload.resultado[k].map(x=>parseInt(x,10));
+    }
+  }
+  return null;
+}
+
+/* ================= STATS ================= */
+function buildRanking(concursos){
+  const c = Array(26).fill(0);
+  concursos.forEach(cs=>{
+    new Set(cs).forEach(n=>{ if(n>=1 && n<=25) c[n]++; });
+  });
+
+  const rows=[];
+  for(let i=1;i<=25;i++){
+    rows.push({ n:z2(i), v:c[i], p:(c[i]/concursos.length)*100 });
+  }
+  rows.sort((a,b)=>b.p-a.p || a.n.localeCompare(b.n));
+  return rows;
+}
+
+/* ================= CHARTS ================= */
+let chartTop=null, chartBottom=null, chartHist=null;
+
+function renderCharts(rows){
+  const top = rows.slice(0,10);
+  const bottom = [...rows].slice(-10).reverse();
+
+  const elTop = document.getElementById("chartTop");
+  const elBottom = document.getElementById("chartBottom");
+  const elHist = document.getElementById("chartHist");
+
+  if(chartTop) chartTop.destroy();
+  if(chartBottom) chartBottom.destroy();
+  if(chartHist) chartHist.destroy();
+
+  chartTop = new Chart(elTop, {
+    type:"bar",
+    data:{ labels:top.map(r=>r.n), datasets:[{ data:top.map(r=>r.v) }] },
+    options:{ plugins:{ legend:{ display:false } } }
+  });
+
+  chartBottom = new Chart(elBottom, {
+    type:"bar",
+    data:{ labels:bottom.map(r=>r.n), datasets:[{ data:bottom.map(r=>r.v) }] },
+    options:{ plugins:{ legend:{ display:false } } }
+  });
+
+  const freq = {};
+  rows.forEach(r => { freq[r.v] = (freq[r.v] || 0) + 1; });
+  const xs = Object.keys(freq).map(x=>parseInt(x,10)).sort((a,b)=>a-b);
+
+  chartHist = new Chart(elHist, {
+    type:"bar",
+    data:{ labels:xs.map(String), datasets:[{ data:xs.map(x=>freq[x]) }] },
+    options:{ plugins:{ legend:{ display:false } } }
+  });
+}
+
+/* ================= TABLE ================= */
+function renderTable(rows){
+  const tb=document.getElementById("tbl");
+  tb.innerHTML="";
+  rows.forEach(r=>{
+    tb.insertAdjacentHTML("beforeend",
+      "<tr><td>"+r.n+"</td><td>"+r.v+"</td><td>"+r.p.toFixed(1)+"%</td></tr>"
+    );
+  });
+}
+
+/* ================= JOGOS ================= */
+function pickWeighted(pool,k){
+  const p = pool.map(x=>({ ...x }));
+  const out = [];
+  while(out.length < k && p.length > 0){
+    const sum = p.reduce((a,b)=>a+(b.p || 0.0001),0);
+    let r = Math.random() * sum;
+
+    let idx = 0;
+    for(; idx < p.length; idx++){
+      r -= (p[idx].p || 0.0001);
+      if(r <= 0) break;
+    }
+    if(idx >= p.length) idx = p.length - 1;
+
+    out.push(p[idx].n);
+    p.splice(idx, 1);
+  }
+  return out;
+}
+
+/* ✅ SNIPPET: montado por linhas (sem crase / sem escape quebrado) */
+function buildSnippet(nums){
+  const numsJson = JSON.stringify(nums);
+
+  const lines = [
+    "(async () => {",
+    "  function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }",
+    "  function findClickableByExactText(txt) {",
+    "    const all = [...document.querySelectorAll('body *')];",
+    "    const candidates = all.filter(el => {",
+    "      const t = (el.innerText || '').trim();",
+    "      if (t !== txt) return false;",
+    "      const st = getComputedStyle(el);",
+    "      const clickable = el.tagName === 'BUTTON' || el.tagName === 'A' || el.getAttribute('role') === 'button' || typeof el.onclick === 'function' || el.tabIndex >= 0 || st.cursor === 'pointer';",
+    "      const rect = el.getBoundingClientRect();",
+    "      const visible = rect.width > 5 && rect.height > 5 && st.visibility !== 'hidden' && st.display !== 'none';",
+    "      return clickable && visible;",
+    "    });",
+    "    if (candidates.length) return candidates[0];",
+    "    const any = all.find(el => (el.innerText || '').trim() === txt);",
+    "    if (!any) return null;",
+    "    return any.closest('button,[role=\"button\"],a,[onclick],div,span,li,label');",
+    "  }",
+    "  function clickByNumber(n) {",
+    "    const el = findClickableByExactText(n);",
+    "    if (!el) { console.warn('❌ Não achei:', n); return false; }",
+    "    el.click();",
+    "    return true;",
+    "  }",
+    "  function clickClear() {",
+    "    const labels = ['limpar volante','limpar jogo','limpar','apagar','resetar'];",
+    "    const all = [...document.querySelectorAll('body *')];",
+    "    const el = all.find(e => labels.includes(((e.innerText || '').trim().toLowerCase())));",
+    "    if (el) { (el.closest('button,[role=\"button\"],a,div') || el).click(); return true; }",
+    "    console.warn('❌ Não achei botão de limpar');",
+    "    return false;",
+    "  }",
+    "  const numeros = " + numsJson + ";",
+    "  clickClear();",
+    "  await sleep(400);",
+    "  let ok = 0;",
+    "  for (const n of numeros) {",
+    "    if (clickByNumber(n)) ok++;",
+    "    await sleep(40);",
+    "  }",
+    "  console.log('✅ Jogo preenchido: ' + ok + '/' + numeros.length);",
+    "})();"
+  ];
+
+  return lines.join("\n");
+}
+
+async function copyToClipboard(txt){
+  await navigator.clipboard.writeText(txt);
+}
+
+function renderJogos(label, jogos){
+  saidaEl.textContent = label + "\n\n" +
+    jogos.map((j,i)=>"Jogo "+(i+1)+": "+j.slice().sort().join(" ")).join("\n");
+
+  botoesSnippetsEl.innerHTML = "";
+  jogos.forEach((j,i)=>{
+    const b = document.createElement("button");
+    b.textContent = "Copiar snippet Caixa — Jogo " + (i+1);
+    b.onclick = async () => {
+      try {
+        await copyToClipboard(buildSnippet(j));
+        alert("Snippet copiado! Cole no Console do site da Caixa.");
+      } catch (e) {
+        console.log(buildSnippet(j));
+        alert("Não consegui copiar automaticamente. Imprimi no console para você copiar.");
+      }
+    };
+    botoesSnippetsEl.appendChild(b);
+  });
+}
+
+/* ================= INIT ================= */
+async function init(){
+  try{
+    ok("carregando API…");
+    const ult = await fetchJson(API + "/ultimo");
+
+    const ultimoNum = getConcursoNumber(ult);
+    if(!ultimoNum) {
+      console.log("Resposta do /ultimo:", ult);
+      throw new Error("Não encontrei o número do concurso no /ultimo (ver console).");
+    }
+
+    const base = [ult];
+    let n = ultimoNum - 1;
+
+    while(base.length < TOTAL && n > 0){
+      try { base.push(await fetchJson(API + "/" + n)); } catch {}
+      n--;
+    }
+
+    const concursos = base
+      .map(b => extrairDezenas(b))
+      .filter(a => Array.isArray(a) && a.length);
+
+    if(concursos.length < 10) throw new Error("Dados insuficientes (provável instabilidade/CORS).");
+
+    const ranking = buildRanking(concursos);
+
+    baseInfoEl.textContent = "Base: " + concursos.length + " concursos (último: " + ultimoNum + ")";
+    ok("ok");
+
+    renderCharts(ranking);
+    renderTable(ranking);
+
+    btnQuentes.disabled = false;
+    btnBalanceada.disabled = false;
+    btnCopiar.disabled = false;
+
+    btnQuentes.onclick = () => {
+      const jogos = [];
+      const pool = ranking.slice(0, 18);
+      for(let i=0;i<5;i++) jogos.push(pickWeighted(pool, 15));
+      renderJogos("QUENTES — 5 jogos (Top 18 ponderado)", jogos);
+    };
+
+    btnBalanceada.onclick = () => {
+      const jogos = [];
+      const hot = ranking.slice(0, 10);
+      const mid = ranking.slice(10, 20);
+      const cold = ranking.slice(20, 25);
+
+      for(let i=0;i<5;i++){
+        const j = [
+          ...pickWeighted(hot, 8),
+          ...pickWeighted(mid, 5),
+          ...pickWeighted(cold, 2)
+        ];
+        const unique = [...new Set(j)];
+        jogos.push(unique.slice(0, 15));
+      }
+      renderJogos("BALANCEADA — 5 jogos (8Q + 5M + 2F ponderado)", jogos);
+    };
+
+    btnCopiar.onclick = async () => {
+      try { await copyToClipboard(saidaEl.textContent); alert("Lista copiada!"); }
+      catch { alert("Não consegui copiar automaticamente. Selecione e copie manualmente."); }
+    };
+
+    saidaEl.textContent = "(clique em Quentes ou Balanceada para gerar 5 jogos)";
+
+  }catch(e){
+    console.error(e);
+    err("falha");
+    saidaEl.textContent = "Erro ao carregar dados. Abra o Console (F12) para detalhes.";
+  }
+}
+
+init();
+</script>
+
+</body>
+</html>
