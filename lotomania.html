@@ -1,0 +1,567 @@
+<!doctype html>
+<html lang="pt-br">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Lotomania — Relatório (HTML + JS)</title>
+
+  <!-- Chart.js (CDN) -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+
+  <style>
+    body { font-family: Arial, sans-serif; margin: 24px; }
+    h1 { margin-bottom: 6px; }
+    .muted { color:#666; font-size: 12px; }
+    .card { border:1px solid #ddd; border-radius:12px; padding:16px; margin: 14px 0; }
+    .row { display:grid; grid-template-columns: 1fr 1fr; gap:14px; }
+    @media (max-width: 980px) { .row { grid-template-columns: 1fr; } }
+
+    button { padding:10px 12px; border:1px solid #ccc; border-radius:10px; background:#fff; cursor:pointer; }
+    button:hover { background:#f4f4f4; }
+
+    pre { background:#fafafa; padding:12px; border:1px solid #ddd; border-radius:10px; white-space:pre-wrap; margin:0; }
+
+    table { border-collapse: collapse; width:100%; font-size: 13px; }
+    th, td { border: 1px solid #ddd; padding: 6px 8px; text-align: left; }
+    th { background:#f6f6f6; position: sticky; top: 0; z-index: 1; }
+
+    .pill { display:inline-block; padding:2px 8px; border-radius:999px; border:1px solid #ddd; font-size: 12px; }
+    .danger { border-color:#f2b0b0; background:#fff5f5; }
+    .ok { border-color:#b8e3b8; background:#f3fff3; }
+
+    .status { display:flex; gap:10px; align-items:center; flex-wrap: wrap; }
+    .spacer { height: 8px; }
+  </style>
+</head>
+
+<body>
+  <h1>Lotomania — análise (últimos <span id="nConcursos">50</span> concursos)</h1>
+
+  <div class="status muted">
+    <span class="pill" id="pillStatus">carregando…</span>
+    <span id="baseInfo">—</span>
+  </div>
+
+  <div class="card">
+    <h2>Gerador de apostas (5 jogos)</h2>
+    <p class="muted">
+      Gera 5 jogos com 50 números usando seus percentuais. Depois use “Copiar snippet Caixa” para colar no Console do site da Caixa.
+    </p>
+
+    <div style="display:flex; gap:10px; flex-wrap:wrap; margin:10px 0;">
+      <button id="btnQuentes" disabled>🔥 Quentes (5 jogos)</button>
+      <button id="btnBalanceada" disabled>⚖️ Balanceada (5 jogos)</button>
+      <button id="btnCopiarLista" disabled>📋 Copiar lista (texto)</button>
+    </div>
+
+    <pre id="saida">(aguardando dados…)</pre>
+    <div id="botoesSnippets" style="margin-top:12px; display:flex; gap:10px; flex-wrap:wrap;"></div>
+
+    <div class="spacer"></div>
+  </div>
+
+  <div class="row">
+    <div class="card">
+      <h2>Top 20 quentes</h2>
+      <canvas id="chartTop"></canvas>
+    </div>
+    <div class="card">
+      <h2>Top 20 frios</h2>
+      <canvas id="chartBottom"></canvas>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Distribuição geral (00–99)</h2>
+    <p class="muted">
+      Histograma: mostra quantos números tiveram X aparições nos últimos concursos (ex.: quantos números apareceram 8 vezes, 9 vezes, 10 vezes…).
+    </p>
+    <canvas id="chartHist"></canvas>
+  </div>
+
+  <div class="card">
+    <h2>Tabela completa (00–99) — ordenada por percentual (desc)</h2>
+    <div style="max-height: 520px; overflow:auto;">
+      <table id="tblCompleta">
+        <thead>
+          <tr>
+            <th>Número</th>
+            <th>Vezes</th>
+            <th>%</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Concursos usados</h2>
+    <ol id="listaConcursos" class="muted"></ol>
+  </div>
+
+
+<script>
+/* ============================
+   CONFIG
+============================ */
+const API_BASE = "https://api.guidi.dev.br/loteria"; // :contentReference[oaicite:2]{index=2}
+const LOTERIA = "lotomania";
+const N = 50;
+
+/* ============================
+   UI helpers
+============================ */
+const pill = document.getElementById("pillStatus");
+const baseInfoEl = document.getElementById("baseInfo");
+const saidaEl = document.getElementById("saida");
+const botoesSnippetsEl = document.getElementById("botoesSnippets");
+
+const btnQuentes = document.getElementById("btnQuentes");
+const btnBalanceada = document.getElementById("btnBalanceada");
+const btnCopiarLista = document.getElementById("btnCopiarLista");
+
+document.getElementById("nConcursos").textContent = String(N);
+
+function setStatusOk(msg) {
+  pill.textContent = msg;
+  pill.className = "pill ok";
+}
+
+function setStatusErr(msg) {
+  pill.textContent = msg;
+  pill.className = "pill danger";
+}
+
+/* ============================
+   Fetch + parse
+============================ */
+async function fetchJson(url, timeoutMs = 15000) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const r = await fetch(url, { signal: ctrl.signal });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    return await r.json();
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+function tryGetDezenas(payload) {
+  const directKeys = ["dezenas", "numeros", "listaDezenas", "dezenasSorteadas", "numerosSorteados"];
+  for (const k of directKeys) {
+    if (Array.isArray(payload?.[k]) && payload[k].length) return payload[k].map(x => parseInt(x, 10));
+  }
+  const inner = payload?.resultado;
+  if (inner && typeof inner === "object") {
+    for (const k of directKeys) {
+      if (Array.isArray(inner?.[k]) && inner[k].length) return inner[k].map(x => parseInt(x, 10));
+    }
+  }
+  return null;
+}
+
+function getConcursoNumber(payload) {
+  const keys = ["concurso", "numero", "numeroConcurso"];
+  for (const k of keys) {
+    if (payload?.[k] != null && !isNaN(parseInt(payload[k], 10))) return parseInt(payload[k], 10);
+  }
+  for (const [k, v] of Object.entries(payload || {})) {
+    if (typeof v === "number" && k.toLowerCase().includes("conc")) return v;
+  }
+  return null;
+}
+
+function getData(payload) {
+  const keys = ["data", "dataSorteio", "dtApuracao", "dataConcurso"];
+  for (const k of keys) {
+    if (typeof payload?.[k] === "string" && payload[k]) return payload[k];
+  }
+  return "";
+}
+
+function z2(n) { return String(n).padStart(2, "0"); }
+
+/* ============================
+   Stats
+============================ */
+function buildFrequency(concursos) {
+  const counts = new Array(100).fill(0);
+
+  for (const c of concursos) {
+    const uniq = new Set(c.dezenas);
+    for (const d of uniq) {
+      if (d >= 0 && d <= 99) counts[d] += 1;
+    }
+  }
+
+  const total = concursos.length || 1;
+  const rows = [];
+  for (let i = 0; i < 100; i++) {
+    const vezes = counts[i];
+    const pct = (vezes / total) * 100;
+    rows.push({ Numero: z2(i), Vezes: vezes, Percentual: pct });
+  }
+
+  rows.sort((a,b) => {
+    if (b.Percentual !== a.Percentual) return b.Percentual - a.Percentual;
+    if (b.Vezes !== a.Vezes) return b.Vezes - a.Vezes;
+    return a.Numero.localeCompare(b.Numero);
+  });
+
+  return rows;
+}
+
+/* ============================
+   Charts
+============================ */
+let chartTop = null, chartBottom = null, chartHist = null;
+
+function renderCharts(rankingRows) {
+  const top20 = rankingRows.slice(0, 20);
+  const bottom20 = rankingRows.slice(-20).slice().sort((a,b) => a.Vezes - b.Vezes || a.Numero.localeCompare(b.Numero));
+
+  // Histogram: frequency of "Vezes"
+  const maxV = Math.max(...rankingRows.map(r => r.Vezes));
+  const histCounts = new Array(maxV + 1).fill(0);
+  for (const r of rankingRows) histCounts[r.Vezes] += 1;
+
+  const histLabels = [];
+  const histValues = [];
+  for (let i = 0; i < histCounts.length; i++) {
+    histLabels.push(String(i));
+    histValues.push(histCounts[i]);
+  }
+
+  if (chartTop) chartTop.destroy();
+  if (chartBottom) chartBottom.destroy();
+  if (chartHist) chartHist.destroy();
+
+  chartTop = new Chart(document.getElementById("chartTop"), {
+    type: "bar",
+    data: { labels: top20.map(r => r.Numero), datasets: [{ label: "Aparições", data: top20.map(r => r.Vezes) }] },
+    options: { responsive: true, plugins: { legend: { display: false } } }
+  });
+
+  chartBottom = new Chart(document.getElementById("chartBottom"), {
+    type: "bar",
+    data: { labels: bottom20.map(r => r.Numero), datasets: [{ label: "Aparições", data: bottom20.map(r => r.Vezes) }] },
+    options: { responsive: true, plugins: { legend: { display: false } } }
+  });
+
+  chartHist = new Chart(document.getElementById("chartHist"), {
+    type: "bar",
+    data: { labels: histLabels, datasets: [{ label: "Qtde de números", data: histValues }] },
+    options: {
+      responsive: true,
+      plugins: { legend: { display: false } },
+      scales: {
+        x: { title: { display: true, text: "Aparições em concursos" } },
+        y: { title: { display: true, text: "Quantidade de números (00–99)" }, beginAtZero: true }
+      }
+    }
+  });
+}
+
+/* ============================
+   Table + contests
+============================ */
+function renderTable(rankingRows) {
+  const tbody = document.querySelector("#tblCompleta tbody");
+  tbody.innerHTML = "";
+  for (const r of rankingRows) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${r.Numero}</td>
+      <td>${r.Vezes}</td>
+      <td>${r.Percentual.toFixed(1)}%</td>
+    `;
+    tbody.appendChild(tr);
+  }
+}
+
+function renderConcursos(concursos) {
+  const ol = document.getElementById("listaConcursos");
+  ol.innerHTML = "";
+  for (const c of concursos) {
+    const li = document.createElement("li");
+    const dezenasOrdenadas = Array.from(new Set(c.dezenas)).sort((a,b)=>a-b).map(z2).join(", ");
+    li.innerHTML = `<b>${c.numero}</b> (${c.data || "data indisponível"}): ${dezenasOrdenadas}`;
+    ol.appendChild(li);
+  }
+}
+
+/* ============================
+   Betting strategies + snippets
+============================ */
+function sortNumeric2Digits(arr) {
+  return arr.slice().sort((a,b)=>parseInt(a,10)-parseInt(b,10));
+}
+
+function weightedPickNoReplace(items, k) {
+  // items: [{Numero, Percentual, ...}]
+  const pool = items.map(x => ({...x}));
+  const picked = [];
+  for (let t = 0; t < k && pool.length > 0; t++) {
+    const totalW = pool.reduce((acc, x) => acc + (x.Percentual || 0), 0);
+    let r = Math.random() * totalW;
+
+    let idx = 0;
+    for (; idx < pool.length; idx++) {
+      r -= (pool[idx].Percentual || 0);
+      if (r <= 0) break;
+    }
+    if (idx >= pool.length) idx = pool.length - 1;
+
+    picked.push(pool[idx].Numero);
+    pool.splice(idx, 1);
+  }
+  return picked;
+}
+
+function toSnippetArray(nums) {
+  return nums.map(n => `"${n}"`).join(",");
+}
+
+function buildCaixaSnippet(nums) {
+  const numerosLine = toSnippetArray(nums);
+
+  return `(async () => {
+
+  function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
+
+  function findClickableByExactText(txt) {
+    const all = [...document.querySelectorAll("body *")];
+
+    const candidates = all.filter(el => {
+      const t = (el.innerText || "").trim();
+      if (t !== txt) return false;
+
+      const st = getComputedStyle(el);
+      const clickable =
+        el.tagName === "BUTTON" ||
+        el.tagName === "A" ||
+        el.getAttribute("role") === "button" ||
+        typeof el.onclick === "function" ||
+        el.tabIndex >= 0 ||
+        st.cursor === "pointer";
+
+      const rect = el.getBoundingClientRect();
+      const visible =
+        rect.width > 5 &&
+        rect.height > 5 &&
+        st.visibility !== "hidden" &&
+        st.display !== "none";
+
+      return clickable && visible;
+    });
+
+    if (candidates.length) return candidates[0];
+
+    const any = all.find(el => (el.innerText || "").trim() === txt);
+    if (!any) return null;
+
+    return any.closest('button,[role="button"],a,[onclick],div,span,li,label');
+  }
+
+  function clickByNumber(n) {
+    const el = findClickableByExactText(n);
+    if (!el) {
+      console.warn("❌ Não achei:", n);
+      return false;
+    }
+    el.click();
+    return true;
+  }
+
+  function clickClear() {
+    const el = [...document.querySelectorAll("body *")]
+      .find(e => (e.innerText || "").trim().toLowerCase() === "limpar volante");
+    if (el) {
+      (el.closest('button,[role="button"],a,div') || el).click();
+      return true;
+    }
+    console.warn("❌ Não achei 'Limpar Volante'");
+    return false;
+  }
+
+  const numeros = [
+    ${numerosLine}
+  ];
+
+  clickClear();
+  await sleep(400);
+
+  let ok = 0;
+  for (const n of numeros) {
+    if (clickByNumber(n)) ok++;
+    await sleep(40);
+  }
+
+  console.log(\`✅ Jogo preenchido: \${ok}/\${numeros.length}\`);
+
+})();`;
+}
+
+async function copiarCaixaSnippet(nums, label) {
+  const snippet = buildCaixaSnippet(nums);
+  try {
+    await navigator.clipboard.writeText(snippet);
+    alert(`Snippet copiado (${label})! Cole no Console do site da Caixa.`);
+  } catch (e) {
+    alert("Não consegui copiar automaticamente. Vou imprimir no console pra você copiar.");
+    console.log(snippet);
+  }
+}
+
+function renderSnippetButtons(jogos, titulo) {
+  botoesSnippetsEl.innerHTML = "";
+  jogos.forEach((nums, i) => {
+    const btn = document.createElement("button");
+    btn.textContent = `Copiar snippet Caixa — ${titulo} #${i+1}`;
+    btn.onclick = () => copiarCaixaSnippet(sortNumeric2Digits(nums), `${titulo} #${i+1}`);
+    botoesSnippetsEl.appendChild(btn);
+  });
+}
+
+function renderJogos(label, jogos, tituloBotoes) {
+  const lines = [];
+  lines.push(label);
+  lines.push("");
+  jogos.forEach((nums, i) => lines.push(`Jogo ${i+1}: ${sortNumeric2Digits(nums).join(" ")}`));
+  saidaEl.textContent = lines.join("\n");
+  renderSnippetButtons(jogos, tituloBotoes);
+}
+
+async function copiarListaTexto() {
+  const txt = saidaEl.textContent || "";
+  if (!txt || txt.includes("aguardando") || txt.includes("(aguardando") || txt.includes("(carregando")) return;
+  try {
+    await navigator.clipboard.writeText(txt);
+    alert("Lista copiada!");
+  } catch {
+    alert("Não consegui copiar automaticamente. Selecione e copie manualmente.");
+  }
+}
+
+/* ============================
+   App state
+============================ */
+let rankingRows = null;
+
+function gerarQuentes5() {
+  const pool = rankingRows.slice(0, 70);
+  const jogos = [];
+  for (let i = 0; i < 5; i++) jogos.push(weightedPickNoReplace(pool, 50));
+  renderJogos("Estratégia: QUENTES — 5 jogos (Top 70 ponderado por %)", jogos, "Quentes");
+}
+
+function gerarBalanceada5() {
+  const hotPool = rankingRows.slice(0, 30);
+  const midPool = rankingRows.slice(30, 70);
+  const coldPool = rankingRows.slice(70, 100);
+
+  const jogos = [];
+  for (let i = 0; i < 5; i++) {
+    const partHot = weightedPickNoReplace(hotPool, 30);
+    const partMid = weightedPickNoReplace(midPool, 15);
+    const partCold = weightedPickNoReplace(coldPool, 5);
+
+    const unique = Array.from(new Set([...partHot, ...partMid, ...partCold]));
+    while (unique.length < 50) {
+      const extra = weightedPickNoReplace(midPool, 1)[0];
+      if (!unique.includes(extra)) unique.push(extra);
+    }
+    jogos.push(unique.slice(0, 50));
+  }
+
+  renderJogos("Estratégia: BALANCEADA — 5 jogos (30Q + 15M + 5F ponderado)", jogos, "Balanceada");
+}
+
+/* ============================
+   Boot
+============================ */
+async function init() {
+  try {
+    setStatusOk("carregando API…");
+
+    const ultimoPayload = await fetchJson(`${API_BASE}/${LOTERIA}/ultimo`);
+    const ultimo = getConcursoNumber(ultimoPayload);
+    if (!ultimo) throw new Error("Não consegui identificar o concurso mais recente.");
+
+    // carrega o último já obtido
+    const concursos = [];
+    {
+      const dezenas = tryGetDezenas(ultimoPayload);
+      if (!dezenas) throw new Error("Não encontrei dezenas no /ultimo.");
+      concursos.push({ numero: ultimo, data: getData(ultimoPayload), dezenas });
+    }
+
+    // busca os anteriores
+    let cur = ultimo - 1;
+    let fails = 0;
+    while (concursos.length < N && cur > 0) {
+      try {
+        const p = await fetchJson(`${API_BASE}/${LOTERIA}/${cur}`);
+        const dezenas = tryGetDezenas(p);
+        if (dezenas) {
+          concursos.push({ numero: cur, data: getData(p), dezenas });
+          fails = 0;
+        } else {
+          fails++;
+        }
+      } catch {
+        fails++;
+      } finally {
+        cur--;
+      }
+      if (fails > 35) break; // evita loop infinito em instabilidade
+    }
+
+    concursos.sort((a,b)=>b.numero-a.numero);
+
+    rankingRows = buildFrequency(concursos);
+
+    // UI
+    baseInfoEl.textContent = `Base: ${concursos.length} concursos (de ${concursos[concursos.length-1].numero} até ${concursos[0].numero})`;
+    setStatusOk("OK (dados carregados)");
+
+    renderCharts(rankingRows);
+    renderTable(rankingRows);
+    renderConcursos(concursos);
+
+    // enable buttons
+    btnQuentes.disabled = false;
+    btnBalanceada.disabled = false;
+    btnCopiarLista.disabled = false;
+
+    btnQuentes.onclick = gerarQuentes5;
+    btnBalanceada.onclick = gerarBalanceada5;
+    btnCopiarLista.onclick = copiarListaTexto;
+
+    saidaEl.textContent = "(clique em 'Quentes' ou 'Balanceada' para gerar 5 jogos)";
+
+  } catch (e) {
+    console.error(e);
+    setStatusErr("falhou (provável CORS ou instabilidade)");
+    saidaEl.textContent =
+`Não consegui carregar a API no navegador.
+
+Possíveis causas:
+- CORS bloqueado pela API
+- instabilidade temporária
+
+Abra o Console (F12) para ver o erro.
+
+Soluções fáceis:
+1) GitHub Actions gerar data/lotomania.json diariamente e o site lê esse arquivo.
+2) Usar um proxy serverless (Cloudflare Worker/Vercel) para liberar CORS.`;
+  }
+}
+
+init();
+</script>
+
+</body>
+</html>
